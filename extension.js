@@ -1,703 +1,477 @@
-/*
-Copyright (C) 2025-2026  Frederyk Abryan Palinoan
-
-This program is free software; you can redistribute it and/or
-modify it under the terms of the GNU General Public License
-as published by the Free Software Foundation; either version 2
-of the License, or (at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program; if not, visit https://www.gnu.org/licenses/.
-*/
-
-import Clutter from 'gi://Clutter';
-import Gio from 'gi://Gio';
+import St from 'gi://St';
 import GLib from 'gi://GLib';
+import Gio from 'gi://Gio';
+import Soup from 'gi://Soup?version=3.0';
+import Clutter from 'gi://Clutter';
+import GObject from 'gi://GObject';
+
+import * as Config from 'resource:///org/gnome/shell/misc/config.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
-import { ANIMATION_TIME } from 'resource:///org/gnome/shell/ui/overview.js';
-import { Extension, InjectionManager } from 'resource:///org/gnome/shell/extensions/extension.js';
-import * as PanelModule from 'resource:///org/gnome/shell/ui/panel.js';
-import * as LoginManager from 'resource:///org/gnome/shell/misc/loginManager.js';
-
-// Shell version for feature detection - centralized here and exported for other modules
-
-import * as Common from './common.js';
-export const shellVersion = Common.shellVersion;
-export const patchAddActorMethod = Common.patchAddActorMethod;
-export const copyClass = Common.copyClass;
-
-import * as MMLayout from './mmlayout.js';
-import * as MMDock from './mmdock.js';
-import * as MMOverview from './mmoverview.js';
-import * as MMPanel from './mmpanel.js';
-import * as ScreenshotPatch from './screenshotPatch.js';
-import { MonitorIndicatorsController } from './monitorIndicatorsDialog.js';
-import { PANEL_LAYOUT_KEY, panelColor } from './monitorPanelPolicy.js';
-
-const MUTTER_SCHEMA = 'org.gnome.mutter';
-const WORKSPACES_ONLY_ON_PRIMARY_ID = 'workspaces-only-on-primary';
-
-const THUMBNAILS_SLIDER_POSITION_ID = 'thumbnails-slider-position';
-const DATE_TIME_POSITION_ID = 'date-time-position';
-
-export let mmPanel = [];
-export let mmOverview = null;
-export let mmLayoutManager = null;
-
-const DASH_TO_DOCK_SCHEMA = 'org.gnome.shell.extensions.dash-to-dock';
-const DASH_TO_DOCK_MULTI_MONITOR_ID = 'multi-monitor';
-
-export default class MultiMonitorsExtension extends Extension {
-	constructor(metadata) {
-		super(metadata);
-		this._settings = null;
-		this._mu_settings = null;
-		this._mmMonitors = 0;
-		this._primaryIndex = -1;
-		this._primaryDock = null;
-		this.syncWorkspacesActualGeometry = null;
-
-		this._switchOffThumbnailsMuId = null;
-		this._showPanelId = null;
-		this._thumbnailsSliderPositionId = null;
-		this._relayoutId = null;
-		this._prepareForSleepId = null;
-		this._resumeFromSleepId = null;
-		this._resumeSessionModeUpdatedId = null;
-		this._mainPanelClipState = null;
-		this._mainPanelInjectionManager = null;
-		this._showDockId = null;
-		this._dtdSettings = null;
-		this._savedDockMultiMonitor = null;
-		this._mainPanelEnsureIndicator = null;
-		this._mainDateMenuPlacement = null;
-		this._mainDateTimePositionId = null;
-		this._loginManager = null;
-	}
-
-	_getDashToDockSettings() {
-		const schemaSource = Gio.SettingsSchemaSource.get_default();
-		if (!schemaSource)
-			return null;
-		const schema = schemaSource.lookup(DASH_TO_DOCK_SCHEMA, true);
-		if (!schema || !schema.has_key(DASH_TO_DOCK_MULTI_MONITOR_ID))
-			return null;
-		return new Gio.Settings({ settings_schema: schema });
-	}
-
-	_applyDashToDockMultiMonitor() {
-		const enabled = this._settings.get_boolean('show-dock-on-extended-monitors');
-		if (!this._dtdSettings)
-			this._dtdSettings = this._getDashToDockSettings();
-
-		if (!this._dtdSettings)
-			return;
-
-		if (enabled) {
-			// Save original value only on first apply
-			if (this._savedDockMultiMonitor === null)
-				this._savedDockMultiMonitor = this._dtdSettings.get_boolean(DASH_TO_DOCK_MULTI_MONITOR_ID);
-			this._dtdSettings.set_boolean(DASH_TO_DOCK_MULTI_MONITOR_ID, true);
-		} else {
-			// Restore original value if we previously saved one
-			if (this._savedDockMultiMonitor !== null) {
-				this._dtdSettings.set_boolean(DASH_TO_DOCK_MULTI_MONITOR_ID, this._savedDockMultiMonitor);
-				this._savedDockMultiMonitor = null;
-			}
-		}
-	}
-
-	_restoreDashToDockMultiMonitor() {
-		if (!this._dtdSettings || this._savedDockMultiMonitor === null)
-			return;
-		this._dtdSettings.set_boolean(DASH_TO_DOCK_MULTI_MONITOR_ID, this._savedDockMultiMonitor);
-		this._savedDockMultiMonitor = null;
-	}
-
-	_applyMainPanelClipping() {
-		if (this._mainPanelClipState)
-			return;
-
-		const actors = [
-			Main.layoutManager?.panelBox,
-			Main.panel,
-			Main.panel?._leftBox,
-			Main.panel?._centerBox,
-			Main.panel?._rightBox,
-		].filter(actor => actor);
-
-		this._mainPanelClipState = actors.map(actor => ({
-			actor,
-			clipToAllocation: actor.clip_to_allocation,
-		}));
-
-		for (const actor of actors)
-			actor.clip_to_allocation = true;
-	}
-
-	_restoreMainPanelClipping() {
-		if (!this._mainPanelClipState)
-			return;
-
-		for (const state of this._mainPanelClipState) {
-			state.actor.clip_to_allocation = state.clipToAllocation;
-		}
-		this._mainPanelClipState = null;
-	}
-
-	_applyMainPanelColor() {
-		if (this._mainPanelStyle === undefined)
-			this._mainPanelStyle = Main.panel.get_style();
-		const color = panelColor(this._settings, 'main');
-		Main.panel.set_style(color
-			? `${this._mainPanelStyle ?? ''} background-color: ${color} !important;`
-			: this._mainPanelStyle);
-	}
-
-	_restoreMainPanelColor() {
-		if (this._mainPanelStyle === undefined)
-			return;
-		Main.panel.set_style(this._mainPanelStyle);
-		this._mainPanelStyle = undefined;
-	}
-
-	_applyMainPanelLayout() {
-		this._mainPanelInjectionManager = new InjectionManager();
-		const extension = this;
-		this._mainPanelInjectionManager.overrideMethod(PanelModule.Panel.prototype,
-			'vfunc_allocate', originalMethod => function (box) {
-				originalMethod.call(this, box);
-				if (this === Main.panel)
-					extension._allocateMainPanel(this, box);
-			});
-		Main.panel.queue_relayout();
-	}
-
-	_allocateMainPanel(panel, box) {
-		const width = Math.max(0, box.x2 - box.x1);
-		const height = Math.max(0, box.y2 - box.y1);
-		const [, rightNaturalWidth] = panel._rightBox.get_preferred_width(-1);
-		const rightWidth = Math.min(rightNaturalWidth, width);
-		const rightAllocation = panel._rightBox.get_allocation_box();
-		if (rightAllocation.get_width() >= rightWidth)
-			return;
-
-		// Shell caps each side at half the panel, even when the clock has
-		// moved into the status area. Let that area grow inward as icons arrive.
-		const [, leftNaturalWidth] = panel._leftBox.get_preferred_width(-1);
-		const [centerMinWidth, centerNaturalWidth] = panel._centerBox.get_preferred_width(-1);
-		const remainingWidth = width - rightWidth;
-		const leftWidth = Math.min(leftNaturalWidth,
-			Math.max(0, remainingWidth - centerMinWidth));
-		const centerWidth = Math.min(centerNaturalWidth, remainingWidth - leftWidth);
-		const rtl = panel.get_text_direction() === Clutter.TextDirection.RTL;
-		const centerAllocation = panel._centerBox.get_allocation_box();
-		const originalCenterStart = rtl ? width - centerAllocation.x2 : centerAllocation.x1;
-		const centerStart = Math.max(leftWidth,
-			Math.min(originalCenterStart, remainingWidth - centerWidth));
-
-		const allocate = (actor, start, end) => {
-			const childBox = new Clutter.ActorBox();
-			childBox.x1 = rtl ? width - end : start;
-			childBox.x2 = rtl ? width - start : end;
-			childBox.y1 = 0;
-			childBox.y2 = height;
-			actor.allocate(childBox);
-		};
-		allocate(panel._leftBox, 0, leftWidth);
-		allocate(panel._centerBox, centerStart, centerStart + centerWidth);
-		allocate(panel._rightBox, remainingWidth, width);
-	}
-
-	_restoreMainPanelLayout() {
-		this._mainPanelInjectionManager?.clear();
-		this._mainPanelInjectionManager = null;
-		Main.panel.queue_relayout();
-	}
-
-	_moveMainDateMenu(box, index) {
-		const container = this._mainDateMenuPlacement?.container;
-		if (!container || !box)
-			return;
-
-		const parent = container.get_parent();
-		if (parent === box && parent.get_children().indexOf(container) < index)
-			index--;
-		if (parent === box && parent.get_children().indexOf(container) === index)
-			return;
-		if (parent)
-			parent.remove_child(container);
-		box.insert_child_at_index(container, index);
-	}
-
-	_applyMainDateTimePosition() {
-		const panel = Main.panel;
-		const container = panel?.statusArea?.dateMenu?.container;
-		if (!container)
-			return;
-
-		if (!this._mainDateMenuPlacement || this._mainDateMenuPlacement.container !== container) {
-			const parent = container.get_parent();
-			if (!parent)
-				return;
-			this._mainDateMenuPlacement = {
-				container,
-				parent,
-				index: parent.get_children().indexOf(container),
-			};
-		}
-
-		const position = this._settings.get_string(DATE_TIME_POSITION_ID);
-		if (position === 'left') {
-			this._moveMainDateMenu(panel._leftBox, panel._leftBox.get_n_children());
-		} else if (position === 'right-before-tray' || position === 'right-after-tray') {
-			const box = panel._rightBox;
-			const tray = panel.statusArea.quickSettings;
-			const trayContainer = tray?.container || tray;
-			const trayIndex = box.get_children().indexOf(trayContainer);
-			const index = position === 'right-before-tray' && trayIndex >= 0
-				? trayIndex : box.get_n_children();
-			this._moveMainDateMenu(box, index);
-		} else {
-			const { parent, index } = this._mainDateMenuPlacement;
-			this._moveMainDateMenu(parent, index);
-		}
-	}
-
-	_restoreMainDateTimePosition() {
-		if (!this._mainDateMenuPlacement)
-			return;
-		const { parent, index } = this._mainDateMenuPlacement;
-		this._moveMainDateMenu(parent, index);
-		this._mainDateMenuPlacement = null;
-	}
-
-	_showThumbnailsSlider() {
-
-
-		if (this._settings.get_boolean('force-workspaces-on-all-displays')) {
-			if (this._mu_settings.get_boolean(WORKSPACES_ONLY_ON_PRIMARY_ID))
-				this._mu_settings.set_boolean(WORKSPACES_ONLY_ON_PRIMARY_ID, false);
-		} else {
-			if (!this._mu_settings.get_boolean(WORKSPACES_ONLY_ON_PRIMARY_ID))
-				this._mu_settings.set_boolean(WORKSPACES_ONLY_ON_PRIMARY_ID, true);
-		}
-
-		if (!this._settings.get_boolean('show-overview-on-extended-monitors')) {
-			this._hideThumbnailsSlider();
-			return;
-		}
-
-		if (mmOverview) {
-
-			return;
-		}
-
-		mmOverview = [];
-
-
-		for (let idx = 0; idx < Main.layoutManager.monitors.length; idx++) {
-			if (idx != Main.layoutManager.primaryIndex) {
-
-				mmOverview[idx] = new MMOverview.MultiMonitorsOverview(idx, this._settings);
-			}
-		}
-
-		if (Main.overview.searchController &&
-			Main.overview.searchController._workspacesDisplay &&
-			Main.overview.searchController._workspacesDisplay._syncWorkspacesActualGeometry) {
-			this.syncWorkspacesActualGeometry = Main.overview.searchController._workspacesDisplay._syncWorkspacesActualGeometry;
-			Main.overview.searchController._workspacesDisplay._syncWorkspacesActualGeometry = function () {
-				if (this._inWindowFade)
-					return;
-
-				const primaryView = this._getPrimaryView();
-				if (primaryView) {
-					primaryView.ease({
-						...this._actualGeometry,
-						duration: Main.overview.animationInProgress ? ANIMATION_TIME : 0,
-						mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-					});
-				}
-
-				if (mmOverview) {
-					for (let idx = 0; idx < mmOverview.length; idx++) {
-						if (!mmOverview[idx])
-							continue;
-						if (!mmOverview[idx]._overview)
-							continue;
-						const mmView = mmOverview[idx]._overview._controls._workspacesViews;
-						if (!mmView)
-							continue;
-
-						const mmGeometry = mmOverview[idx].getWorkspacesActualGeometry();
-						mmView.ease({
-							...mmGeometry,
-							duration: Main.overview.animationInProgress ? ANIMATION_TIME : 0,
-							mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-						});
-					}
-				}
-			}
-		} else {
-			this.syncWorkspacesActualGeometry = null;
-		}
-	}
-
-	_hideThumbnailsSlider() {
-		if (!mmOverview)
-			return;
-
-		for (let idx = 0; idx < mmOverview.length; idx++) {
-			if (mmOverview[idx])
-				mmOverview[idx].destroy();
-		}
-		mmOverview = null;
-
-		if (this.syncWorkspacesActualGeometry &&
-			Main.overview.searchController &&
-			Main.overview.searchController._workspacesDisplay) {
-			Main.overview.searchController._workspacesDisplay._syncWorkspacesActualGeometry = this.syncWorkspacesActualGeometry;
-		}
-	}
-
-	_relayout() {
-		const newCount = Main.layoutManager.monitors.length;
-		const newPrimary = Main.layoutManager.primaryIndex;
-		const primaryMonitor = Main.layoutManager.monitors[newPrimary];
-		if (!primaryMonitor) {
-			this._destroyPrimaryDock();
-		} else if (this._primaryDock) {
-			this._primaryDock.updateMonitor(primaryMonitor);
-		} else {
-			// The primary monitor already has GNOME's overview dash, but
-			// needs its own desktop hover dock even with no external displays.
-			this._primaryDock = new MMDock.MultiMonitorsDock(primaryMonitor,
-				this._settings, { showInOverview: false });
-		}
-		if (this._mmMonitors !== newCount || this._primaryIndex !== newPrimary) {
-
-			this._mmMonitors = newCount;
-			this._primaryIndex = newPrimary;
-			this._hideThumbnailsSlider();
-			this._showThumbnailsSlider();
-		}
-	}
-
-	_switchOffThumbnails() {
-		if (this._settings.get_boolean('force-workspaces-on-all-displays') && this._mu_settings.get_boolean(WORKSPACES_ONLY_ON_PRIMARY_ID)) {
-			this._settings.set_string(THUMBNAILS_SLIDER_POSITION_ID, 'none');
-		}
-	}
-
-	_destroyPrimaryDock() {
-		this._primaryDock?.destroy();
-		this._primaryDock = null;
-	}
-
-	enable() {
-		this._mmMonitors = 0;
-		this._primaryIndex = -1;
-
-		this._settings = this.getSettings();
-		this._mu_settings = new Gio.Settings({ schema: MUTTER_SCHEMA });
-		this._applyMainPanelClipping();
-		this._applyMainPanelLayout();
-		this._mainDateTimePositionId = this._settings.connect('changed::' + DATE_TIME_POSITION_ID,
-			this._applyMainDateTimePosition.bind(this));
-		this._applyMainDateTimePosition();
-		this._settings.connectObject('changed::' + PANEL_LAYOUT_KEY,
-			this._applyMainPanelColor.bind(this), this);
-		this._applyMainPanelColor();
-
-		this._switchOffThumbnailsMuId = this._mu_settings.connect('changed::' + WORKSPACES_ONLY_ON_PRIMARY_ID,
-			this._switchOffThumbnails.bind(this));
-		this._forceWorkspacesId = this._settings.connect('changed::force-workspaces-on-all-displays', () => {
-			if (this._settings.get_boolean('force-workspaces-on-all-displays')) {
-				if (this._mu_settings.get_boolean(WORKSPACES_ONLY_ON_PRIMARY_ID))
-					this._mu_settings.set_boolean(WORKSPACES_ONLY_ON_PRIMARY_ID, false);
-			} else {
-				if (!this._mu_settings.get_boolean(WORKSPACES_ONLY_ON_PRIMARY_ID))
-					this._mu_settings.set_boolean(WORKSPACES_ONLY_ON_PRIMARY_ID, true);
-			}
-			this._hideThumbnailsSlider();
-			this._showThumbnailsSlider();
-		});
-
-		this._showOverviewId = this._settings.connect('changed::show-overview-on-extended-monitors', () => {
-			this._hideThumbnailsSlider();
-			this._showThumbnailsSlider();
-		});
-
-		this._showDockId = this._settings.connect('changed::show-dock-on-extended-monitors',
-			this._applyDashToDockMultiMonitor.bind(this));
-		this._applyDashToDockMultiMonitor();
-
-		mmPanel.length = 0;
-		MMLayout.setMMPanelArrayRef(mmPanel);
-		MMPanel.setMMPanelArrayRef(mmPanel);
-		MMOverview.setMMPanelArrayRef(mmPanel);
-
-		mmLayoutManager = new MMLayout.MultiMonitorsLayoutManager(this._settings);
-
-		this._showPanelId = this._settings.connect('changed::' + MMLayout.SHOW_PANEL_ID, mmLayoutManager.showPanel.bind(mmLayoutManager));
-		mmLayoutManager.showPanel();
-
-		this._thumbnailsSliderPositionId = this._settings.connect('changed::' + THUMBNAILS_SLIDER_POSITION_ID, this._showThumbnailsSlider.bind(this));
-		this._relayoutId = Main.layoutManager.connect('monitors-changed', this._relayout.bind(this));
-		this._relayout();
-
-		// Proactively tear down extra panels before suspend so the lock
-		// screen on wake gets correct single-monitor geometry.
-		this._loginManager = LoginManager.getLoginManager();
-		this._prepareForSleepId = this._loginManager.connect('prepare-for-sleep',
-			(mgr, aboutToSuspend) => {
-				if (aboutToSuspend)
-					this._onPrepareForSleep();
-				else
-					this._onResumeFromSleep();
-			});
-
-
-		if (!this._mainPanelEnsureIndicator)
-			this._mainPanelEnsureIndicator = Main.panel._ensureIndicator;
-
-		Main.panel._ensureIndicator = function (role) {
-			let indicator = this.statusArea[role];
-			if (indicator) {
-				indicator.container.show();
-				return null;
-			}
-			else {
-				let constructor = PanelModule.PANEL_ITEM_IMPLEMENTATIONS[role];
-				if (!constructor) {
-					return null;
-				}
-				indicator = new constructor(this);
-				this.statusArea[role] = indicator;
-			}
-			return indicator;
-		};
-
-		// Patch screenshot UI to open on cursor's monitor (or all monitors based on setting)
-		ScreenshotPatch.patchScreenshotUI(this._settings);
-		this._monitorIndicators = new MonitorIndicatorsController(this._settings, () => mmPanel);
-	}
-
-	disable() {
-		this._monitorIndicators?.destroy();
-		this._monitorIndicators = null;
-		this._destroyPrimaryDock();
-		// Unpatch screenshot UI
-		ScreenshotPatch.unpatchScreenshotUI();
-
-		if (this._prepareForSleepId) {
-			this._loginManager.disconnect(this._prepareForSleepId);
-			this._prepareForSleepId = null;
-		}
-		this._loginManager = null;
-
-		if (this._resumeFromSleepId) {
-			GLib.source_remove(this._resumeFromSleepId);
-			this._resumeFromSleepId = null;
-		}
-		this._disconnectResumeSessionWatcher();
-
-		if (this._relayoutId) {
-			Main.layoutManager.disconnect(this._relayoutId);
-			this._relayoutId = null;
-		}
-
-		if (this._switchOffThumbnailsMuId) {
-			this._mu_settings.disconnect(this._switchOffThumbnailsMuId);
-			this._switchOffThumbnailsMuId = null;
-		}
-
-		if (this._forceWorkspacesId) {
-			this._settings.disconnect(this._forceWorkspacesId);
-			this._forceWorkspacesId = null;
-		}
-
-		if (this._showOverviewId) {
-			this._settings.disconnect(this._showOverviewId);
-			this._showOverviewId = null;
-		}
-
-		if (this._showDockId) {
-			this._settings.disconnect(this._showDockId);
-			this._showDockId = null;
-		}
-		this._restoreDashToDockMultiMonitor();
-		this._dtdSettings = null;
-
-		if (this._showPanelId) {
-			this._settings.disconnect(this._showPanelId);
-			this._showPanelId = null;
-		}
-
-		if (this._thumbnailsSliderPositionId) {
-			this._settings.disconnect(this._thumbnailsSliderPositionId);
-			this._thumbnailsSliderPositionId = null;
-		}
-		if (this._mainDateTimePositionId) {
-			this._settings.disconnect(this._mainDateTimePositionId);
-			this._mainDateTimePositionId = null;
-		}
-		this._restoreMainDateTimePosition();
-		this._settings.disconnectObject(this);
-		this._restoreMainPanelColor();
-		this._restoreMainPanelLayout();
-
-		this._restoreMainPanelClipping();
-
-		if (mmLayoutManager) {
-			mmLayoutManager.hidePanel();
-			mmLayoutManager = null;
-		}
-
-		if (this._mainPanelEnsureIndicator) {
-			Main.panel._ensureIndicator = this._mainPanelEnsureIndicator;
-			this._mainPanelEnsureIndicator = null;
-		}
-
-		this._hideThumbnailsSlider();
-		this._mmMonitors = 0;
-		this._primaryIndex = -1;
-
-		mmPanel.length = 0;
-
-		this._settings = null;
-		this._mu_settings = null;
-	}
-
-
-	/**
-	 * Called just before the system suspends.  Tear down all extra-monitor
-	 * chrome so GNOME Shell's layout regions are clean when the lock
-	 * screen dialog is positioned on wake.
-	 */
-	_onPrepareForSleep() {
-		this._destroyPrimaryDock();
-
-		if (this._resumeFromSleepId) {
-			GLib.source_remove(this._resumeFromSleepId);
-			this._resumeFromSleepId = null;
-		}
-		this._disconnectResumeSessionWatcher();
-
-		if (mmLayoutManager) {
-			mmLayoutManager.hidePanel();
-		}
-		this._hideThumbnailsSlider();
-		this._mmMonitors = 0;
-		this._primaryIndex = -1;
-		mmPanel.length = 0;
-	}
-
-	/**
-	 * Called after wake.  Rebuild secondary-monitor chrome after GNOME Shell has
-	 * restored monitor/workarea state, otherwise mirrored indicators can keep
-	 * stale source/menu references from before suspend.
-	 */
-	_onResumeFromSleep() {
-
-		this._queueResumeRebuild(1000);
-	}
-
-	_queueResumeRebuild(delayMs) {
-		if (this._resumeFromSleepId)
-			GLib.source_remove(this._resumeFromSleepId);
-
-		this._resumeFromSleepId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delayMs, () => {
-			this._resumeFromSleepId = null;
-
-			if (!this._settings)
-				return GLib.SOURCE_REMOVE;
-
-			if (!this._isUserSessionActive()) {
-
-				this._waitForUserSessionResume();
-				return GLib.SOURCE_REMOVE;
-			}
-
-			if (!this._isOverviewIdle()) {
-
-				this._queueResumeRebuild(500);
-				return GLib.SOURCE_REMOVE;
-			}
-
-			this._disconnectResumeSessionWatcher();
-			this._rebuildAfterResume();
-			return GLib.SOURCE_REMOVE;
-		});
-	}
-
-	_isUserSessionActive() {
-		const sessionMode = Main.sessionMode;
-		if (!sessionMode)
-			return true;
-
-		if (sessionMode.isLocked)
-			return false;
-
-		return !sessionMode.currentMode || sessionMode.currentMode === 'user';
-	}
-
-	_isOverviewIdle() {
-		return !Main.overview?.visible && !Main.overview?.animationInProgress;
-	}
-
-	_waitForUserSessionResume() {
-		if (this._resumeSessionModeUpdatedId)
-			return;
-
-		this._resumeSessionModeUpdatedId = Main.sessionMode.connect('updated', () => {
-			if (!this._isUserSessionActive())
-				return;
-
-			this._disconnectResumeSessionWatcher();
-			this._queueResumeRebuild(750);
-		});
-	}
-
-	_disconnectResumeSessionWatcher() {
-		if (!this._resumeSessionModeUpdatedId)
-			return;
-
-		Main.sessionMode.disconnect(this._resumeSessionModeUpdatedId);
-		this._resumeSessionModeUpdatedId = null;
-	}
-
-	_rebuildAfterResume() {
-
-
-		if (!mmLayoutManager) {
-			mmLayoutManager = new MMLayout.MultiMonitorsLayoutManager(this._settings);
-
-			if (this._showPanelId) {
-				this._settings.disconnect(this._showPanelId);
-				this._showPanelId = null;
-			}
-			this._showPanelId = this._settings.connect('changed::' + MMLayout.SHOW_PANEL_ID,
-				mmLayoutManager.showPanel.bind(mmLayoutManager));
-		} else {
-			mmLayoutManager.hidePanel();
-		}
-
-		mmPanel.length = 0;
-		MMLayout.setMMPanelArrayRef(mmPanel);
-		MMPanel.setMMPanelArrayRef(mmPanel);
-		MMOverview.setMMPanelArrayRef(mmPanel);
-
-		mmLayoutManager.showPanel();
-		this._hideThumbnailsSlider();
-		this._mmMonitors = 0;
-		this._primaryIndex = -1;
-		this._relayout();
-	}
+import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
+import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
+import {Extension, gettext as _, pgettext} from 'resource:///org/gnome/shell/extensions/extension.js';
+
+const REFRESH_SECONDS = 300;
+const TICK_SECONDS = 1;
+const BAR_WIDTH = 220;
+const SUBPROCESS_TIMEOUT_SECONDS = 25;
+const RETRY_BASE_SECONDS = 15;
+const RETRY_MAX_SECONDS = 120;
+const MAX_RETRIES = 5;
+
+// St.BoxLayout's `vertical` was replaced by `orientation` in GNOME 48.
+const SHELL_MAJOR = parseInt(Config.PACKAGE_VERSION.split('.')[0], 10);
+const VERTICAL_BOX = SHELL_MAJOR >= 48
+    ? {orientation: Clutter.Orientation.VERTICAL}
+    : {vertical: true};
+
+const STATUS_URL = 'https://status.claude.com/api/v2/status.json';
+const STATUS_PAGE_URL = 'https://status.claude.com';
+
+const STATUS_COLORS = {
+    none: '#2ecc71',
+    minor: '#f1c40f',
+    major: '#e67e22',
+    critical: '#e74c3c',
+};
+
+function statusIndicatorLabel(indicator) {
+    const labels = {
+        none: _('All Systems Operational'),
+        minor: _('Minor Service Disruption'),
+        major: _('Major Service Disruption'),
+        critical: _('Critical Service Disruption'),
+    };
+    return labels[indicator] ?? null;
+}
+
+const MONTHS = {
+    jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+    jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11,
+};
+
+function colorForPercent(pct) {
+    if (pct >= 80)
+        return '#e74c3c';
+    if (pct >= 50)
+        return '#f1c40f';
+    return '#2ecc71';
+}
+
+function parseResetDate(text, now) {
+    // ex: "Jul 23, 7:40pm" ou "Jul 25, 12am"
+    const m = text.match(/([A-Za-z]{3})\s+(\d{1,2}),?\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i);
+    if (!m)
+        return null;
+
+    const month = MONTHS[m[1].toLowerCase().slice(0, 3)];
+    if (month === undefined)
+        return null;
+
+    const day = parseInt(m[2], 10);
+    let hour = parseInt(m[3], 10);
+    const minute = m[4] ? parseInt(m[4], 10) : 0;
+    const ampm = m[5].toLowerCase();
+
+    if (ampm === 'pm' && hour !== 12)
+        hour += 12;
+    if (ampm === 'am' && hour === 12)
+        hour = 0;
+
+    const date = new Date(now.getFullYear(), month, day, hour, minute, 0);
+    if (date < now)
+        date.setFullYear(date.getFullYear() + 1);
+
+    return date;
+}
+
+function formatCountdown(resetDate, now) {
+    if (!resetDate)
+        return '--';
+    let diff = resetDate.getTime() - now.getTime();
+    if (diff < 0)
+        diff = 0;
+
+    const days = Math.floor(diff / 86400000);
+    const hours = Math.floor((diff % 86400000) / 3600000);
+    const minutes = Math.floor((diff % 3600000) / 60000);
+
+    if (days > 0)
+        return `${days}d ${hours}h`;
+    if (hours > 0)
+        return `${hours}h ${minutes}m`;
+    return `${minutes}m`;
+}
+
+function panelLabel(sessionText, weekText) {
+    const sessionAbbr = pgettext('short abbreviation for "session" shown in the top bar', 'S');
+    const weekAbbr = pgettext('short abbreviation for "week" shown in the top bar', 'W');
+    return `${sessionAbbr} ${sessionText} | ${weekAbbr} ${weekText}`;
+}
+
+function parseUsage(output) {
+    const sessionMatch = output.match(/Current session:\s*(\d+)%\s*used\s*·\s*resets\s*([^\n]+)/i);
+    const weekMatch = output.match(/Current week[^:]*:\s*(\d+)%\s*used\s*·\s*resets\s*([^\n]+)/i);
+
+    if (!sessionMatch || !weekMatch)
+        return null;
+
+    return {
+        session: {pct: parseInt(sessionMatch[1], 10), resetText: sessionMatch[2].trim()},
+        week: {pct: parseInt(weekMatch[1], 10), resetText: weekMatch[2].trim()},
+    };
+}
+
+const UsageCard = GObject.registerClass(
+class UsageCard extends St.BoxLayout {
+    _init(title) {
+        super._init({...VERTICAL_BOX, style_class: 'claude-card', x_expand: true});
+
+        this.add_child(new St.Label({text: title, style_class: 'claude-card-title'}));
+
+        this._pctLabel = new St.Label({text: '--%', style_class: 'claude-card-pct'});
+        this.add_child(this._pctLabel);
+
+        this._barBg = new St.Widget({style_class: 'claude-bar-bg', width: BAR_WIDTH, height: 10});
+        this._barFill = new St.Widget({style_class: 'claude-bar-fill', height: 10});
+        this._barBg.add_child(this._barFill);
+        this.add_child(this._barBg);
+
+        this._resetLabel = new St.Label({text: '', style_class: 'claude-card-reset'});
+        this.add_child(this._resetLabel);
+
+        this._countdownLabel = new St.Label({text: '', style_class: 'claude-card-countdown'});
+        this.add_child(this._countdownLabel);
+    }
+
+    setData(pct, resetText) {
+        this._pctLabel.set_text(`${pct}%`);
+        this._pctLabel.set_style(`color: ${colorForPercent(pct)};`);
+
+        const width = Math.round((BAR_WIDTH * Math.min(pct, 100)) / 100);
+        this._barFill.set_width(width);
+        this._barFill.set_style(`background-color: ${colorForPercent(pct)};`);
+
+        // TRANSLATORS: %s is a date/time string, e.g. "Jul 23, 7:40pm"
+        this._resetLabel.set_text(_('Resets at · %s').replace('%s', resetText));
+    }
+
+    setCountdown(text) {
+        this._countdownLabel.set_text(text);
+    }
+});
+
+const ClaudeIndicator = GObject.registerClass(
+class ClaudeIndicator extends PanelMenu.Button {
+    _init(extension) {
+        super._init(0.0, _('Claude Status'));
+
+        this._extension = extension;
+        this._lastUpdate = null;
+        this._data = null;
+        this._refreshing = false;
+        this._retryCount = 0;
+        this._retryTimer = null;
+        this._watchdogId = null;
+        this._cancellable = null;
+        this._destroyed = false;
+        this._statusRefreshing = false;
+        this._httpSession = new Soup.Session({timeout: 10});
+
+        const box = new St.BoxLayout({style_class: 'claude-panel-box'});
+
+        this._icon = new St.Icon({
+            gicon: Gio.icon_new_for_string(
+                `${extension.path}/icons/claude-ai-symbol.svg`),
+            style_class: 'system-status-icon',
+        });
+        box.add_child(this._icon);
+
+        this._label = new St.Label({
+            text: panelLabel('--%', '--%'),
+            y_align: Clutter.ActorAlign.CENTER,
+            style_class: 'claude-panel-label',
+        });
+        box.add_child(this._label);
+
+        this.add_child(box);
+
+        this._buildMenu();
+        this._refresh();
+        this._refreshStatus();
+
+        this._refreshTimer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, REFRESH_SECONDS, () => {
+            this._refresh();
+            this._refreshStatus();
+            return GLib.SOURCE_CONTINUE;
+        });
+
+        this._tickTimer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, TICK_SECONDS, () => {
+            this._tick();
+            return GLib.SOURCE_CONTINUE;
+        });
+    }
+
+    _buildMenu() {
+        const headerItem = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
+        const headerBox = new St.BoxLayout({style_class: 'claude-header', x_expand: true});
+
+        headerBox.add_child(new St.Label({
+            text: 'Claude Code',
+            style_class: 'claude-header-title',
+            x_expand: true,
+            y_align: Clutter.ActorAlign.CENTER,
+        }));
+
+        this._updatedLabel = new St.Label({
+            text: '',
+            style_class: 'claude-header-updated',
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        headerBox.add_child(this._updatedLabel);
+
+        const refreshBtn = new St.Button({
+            style_class: 'claude-refresh-btn',
+            child: new St.Icon({icon_name: 'view-refresh-symbolic', icon_size: 14}),
+        });
+        refreshBtn.connect('clicked', () => this._refresh());
+        headerBox.add_child(refreshBtn);
+
+        headerItem.add_child(headerBox);
+        this.menu.addMenuItem(headerItem);
+
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+
+        const cardsItem = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
+        const cardsBox = new St.BoxLayout({style_class: 'claude-cards-box', x_expand: true});
+
+        this._sessionCard = new UsageCard(_('SESSION (5h)'));
+        this._weekCard = new UsageCard(_('WEEK'));
+        cardsBox.add_child(this._sessionCard);
+        cardsBox.add_child(this._weekCard);
+
+        cardsItem.add_child(cardsBox);
+        this.menu.addMenuItem(cardsItem);
+
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+
+        this._statusItem = new PopupMenu.PopupBaseMenuItem();
+        const statusBox = new St.BoxLayout({style_class: 'claude-status-box', x_expand: true});
+
+        this._statusDot = new St.Widget({style_class: 'claude-status-dot'});
+        statusBox.add_child(this._statusDot);
+
+        this._statusLabel = new St.Label({
+            text: _('Checking status…'),
+            style_class: 'claude-status-label',
+            x_expand: true,
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        statusBox.add_child(this._statusLabel);
+
+        this._statusItem.add_child(statusBox);
+        this._statusItem.connect('activate', () => {
+            Gio.AppInfo.launch_default_for_uri(STATUS_PAGE_URL, null);
+        });
+        this.menu.addMenuItem(this._statusItem);
+
+        this._menuOpenStateId = this.menu.connect('open-state-changed', (menu, open) => {
+            if (open)
+                this._tick();
+        });
+    }
+
+    _tick() {
+        if (!this._lastUpdate)
+            return;
+
+        const now = new Date();
+
+        if (this._data) {
+            const sessionReset = parseResetDate(this._data.session.resetText, this._lastUpdate);
+            const weekReset = parseResetDate(this._data.week.resetText, this._lastUpdate);
+            this._sessionCard.setCountdown(formatCountdown(sessionReset, now));
+            this._weekCard.setCountdown(formatCountdown(weekReset, now));
+        }
+
+        if (this.menu.isOpen) {
+            const secs = Math.max(0, Math.round((now - this._lastUpdate) / 1000));
+            // TRANSLATORS: %d is the number of seconds since the last refresh
+            this._updatedLabel.set_text(_('updated %ds ago').replace('%d', secs));
+        }
+    }
+
+    _refresh() {
+        if (this._refreshing)
+            return;
+        this._refreshing = true;
+
+        if (this._retryTimer) {
+            GLib.source_remove(this._retryTimer);
+            this._retryTimer = null;
+        }
+
+        let proc;
+        this._cancellable = new Gio.Cancellable();
+        try {
+            proc = Gio.Subprocess.new(
+                ['/bin/bash', '-lc', 'claude -p "/usage"'],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
+        } catch (e) {
+            logError(e, 'claude-status: falha ao iniciar subprocess');
+            this._refreshing = false;
+            this._cancellable = null;
+            this._scheduleRetry();
+            return;
+        }
+
+        let watchdogFired = false;
+        if (this._watchdogId) {
+            GLib.source_remove(this._watchdogId);
+            this._watchdogId = null;
+        }
+        this._watchdogId = GLib.timeout_add_seconds(
+            GLib.PRIORITY_DEFAULT, SUBPROCESS_TIMEOUT_SECONDS, () => {
+                watchdogFired = true;
+                this._watchdogId = null;
+                logError(new Error(`claude-status: comando excedeu ${SUBPROCESS_TIMEOUT_SECONDS}s, cancelando`));
+                this._cancellable?.cancel();
+                return GLib.SOURCE_REMOVE;
+            });
+
+        proc.communicate_utf8_async(null, this._cancellable, (source, res) => {
+            if (this._watchdogId && !watchdogFired) {
+                GLib.source_remove(this._watchdogId);
+                this._watchdogId = null;
+            }
+            this._refreshing = false;
+            this._cancellable = null;
+            if (this._destroyed)
+                return;
+            try {
+                const [, stdout, stderr] = source.communicate_utf8_finish(res);
+                const exitStatus = source.get_exit_status();
+
+                if (exitStatus !== 0) {
+                    logError(new Error(
+                        `claude-status: comando saiu com codigo ${exitStatus}. stderr: ${(stderr ?? '').trim()}`));
+                    this._scheduleRetry();
+                    return;
+                }
+
+                const parsed = parseUsage(stdout ?? '');
+                if (!parsed) {
+                    logError(new Error(`claude-status: saida inesperada: ${stdout}`));
+                    this._scheduleRetry();
+                    return;
+                }
+
+                this._retryCount = 0;
+                this._data = parsed;
+                this._lastUpdate = new Date();
+
+                this._label.set_text(panelLabel(`${parsed.session.pct}%`, `${parsed.week.pct}%`));
+                this._sessionCard.setData(parsed.session.pct, parsed.session.resetText);
+                this._weekCard.setData(parsed.week.pct, parsed.week.resetText);
+                this._tick();
+            } catch (e) {
+                logError(e, 'claude-status: falha ao ler saida do comando');
+                this._scheduleRetry();
+            }
+        });
+    }
+
+    _scheduleRetry() {
+        if (this._retryCount >= MAX_RETRIES)
+            return;
+
+        this._retryCount += 1;
+        const delay = Math.min(RETRY_BASE_SECONDS * this._retryCount, RETRY_MAX_SECONDS);
+
+        if (this._retryTimer) {
+            GLib.source_remove(this._retryTimer);
+            this._retryTimer = null;
+        }
+        this._retryTimer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, delay, () => {
+            this._retryTimer = null;
+            this._refresh();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    async _refreshStatus() {
+        if (this._statusRefreshing)
+            return;
+        this._statusRefreshing = true;
+
+        try {
+            const message = Soup.Message.new('GET', STATUS_URL);
+            const bytes = await this._httpSession.send_and_read_async(
+                message, GLib.PRIORITY_DEFAULT, null);
+
+            if (message.get_status() !== Soup.Status.OK)
+                throw new Error(`HTTP ${message.get_status()}`);
+
+            const text = new TextDecoder('utf-8').decode(bytes.get_data());
+            const json = JSON.parse(text);
+            const indicator = json.status?.indicator ?? 'none';
+            const description = statusIndicatorLabel(indicator) ?? json.status?.description ?? _('Unknown');
+            const color = STATUS_COLORS[indicator] ?? STATUS_COLORS.none;
+
+            if (this._destroyed)
+                return;
+            this._statusDot.set_style(`background-color: ${color};`);
+            this._statusLabel.set_text(description);
+        } catch (e) {
+            if (!this._destroyed) {
+                logError(e, 'claude-status: falha ao consultar status.claude.com');
+                this._statusDot.set_style(`background-color: ${STATUS_COLORS.none};`);
+                this._statusLabel.set_text(_('Status unavailable'));
+            }
+        } finally {
+            this._statusRefreshing = false;
+        }
+    }
+
+    destroy() {
+        this._destroyed = true;
+
+        if (this._refreshTimer) {
+            GLib.source_remove(this._refreshTimer);
+            this._refreshTimer = null;
+        }
+        if (this._tickTimer) {
+            GLib.source_remove(this._tickTimer);
+            this._tickTimer = null;
+        }
+        if (this._retryTimer) {
+            GLib.source_remove(this._retryTimer);
+            this._retryTimer = null;
+        }
+        if (this._watchdogId) {
+            GLib.source_remove(this._watchdogId);
+            this._watchdogId = null;
+        }
+        if (this._menuOpenStateId) {
+            this.menu.disconnect(this._menuOpenStateId);
+            this._menuOpenStateId = null;
+        }
+
+        this._cancellable?.cancel();
+        this._httpSession?.abort();
+
+        super.destroy();
+    }
+});
+
+export default class ClaudeStatusExtension extends Extension {
+    enable() {
+        this._indicator = new ClaudeIndicator(this);
+        Main.panel.addToStatusArea(this.uuid, this._indicator);
+    }
+
+    disable() {
+        this._indicator?.destroy();
+        this._indicator = null;
+    }
 }
